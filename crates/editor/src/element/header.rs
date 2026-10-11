@@ -28,6 +28,7 @@ use workspace::{ItemHandle, ItemSettings, OpenInTerminal, OpenTerminal, RevealIn
 
 use super::{
     BlockLayout, EditorElement, EditorLayout, LineWithInvisibles, layout_line,
+    long_rows::{row_windowing, visible_highlight_ranges},
     render_breadcrumb_text,
 };
 use crate::{
@@ -295,10 +296,27 @@ impl EditorElement {
                     DisplayPoint::new(sticky_row.next_row(), 0).to_offset(snapshot, Bias::Right);
                 buffer.anchor_before(start)..buffer.anchor_after(end)
             };
+            let sticky_rows = sticky_row..sticky_row.next_row();
+            let row_windowing = row_windowing(
+                snapshot,
+                sticky_rows.clone(),
+                horizontal_viewport,
+                &self.style,
+                self.style.text.font_size.to_pixels(window.rem_size()),
+                window,
+            );
+            let sticky_ranges = visible_highlight_ranges(
+                snapshot,
+                sticky_rows.clone(),
+                sticky_range,
+                row_windowing,
+                &self.style,
+                window,
+            );
             self.populate_point_diagnostics(
                 snapshot,
-                sticky_row..sticky_row.next_row(),
-                std::slice::from_ref(&sticky_range),
+                sticky_rows,
+                &sticky_ranges,
                 std::slice::from_mut(&mut line),
             );
 

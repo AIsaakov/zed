@@ -3,7 +3,11 @@ use std::{path::PathBuf, sync::Arc};
 use benchmarks::bench_utils::random_rust_file;
 use editor::{
     Editor, EditorMode, HighlightKey, MultiBuffer, MultiBufferOffset,
-    actions::{DeleteToPreviousWordStart, SelectAll, SplitSelectionIntoLines},
+    actions::{
+        Backspace, DeleteToPreviousWordStart, MoveLeft, MoveRight, MoveToBeginningOfLine,
+        MoveToEndOfLine, MoveToNextWordEnd, MoveToPreviousWordStart, Newline, SelectAll,
+        SelectToBeginningOfLine, SplitSelectionIntoLines, Undo,
+    },
 };
 use gpui::{
     App, AppContext as _, BenchAppContext, BorrowAppContext as _, Focusable as _, UpdateGlobal as _,
@@ -446,9 +450,7 @@ fn editor_render_unwrapped_long_lines(script: &&str, cx: &mut BenchAppContext) {
         _ => unreachable!(),
     };
     assert!(line.len() > 1024);
-    let text = std::iter::repeat_n(line.as_str(), 200)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let text = [line.as_str(); 200].join("\n");
     let buffer = cx.update(|cx| MultiBuffer::build_simple(&text, cx));
 
     let mut window = cx.add_empty_window();
@@ -473,7 +475,6 @@ fn editor_render_unwrapped_long_lines(script: &&str, cx: &mut BenchAppContext) {
 #[gpui::bench(
     inputs = [
         "type",
-        "backspace",
         "left_right",
         "up_down",
         "home_end",
@@ -509,7 +510,7 @@ fn editor_edit_huge_unwrapped_line(operation: &&str, cx: &mut BenchAppContext) {
             editor.set_style(editor::EditorStyle::default(), window, cx);
             editor.set_soft_wrap_mode(language::language_settings::SoftWrap::None, cx);
             editor.set_use_selection_highlight(false);
-            editor.move_to_end_of_line(&Default::default(), window, cx);
+            editor.move_to_end_of_line(&MoveToEndOfLine::default(), window, cx);
             editor
         });
         window.focus(&editor.focus_handle(cx), cx);
@@ -562,21 +563,14 @@ fn editor_edit_huge_unwrapped_line(operation: &&str, cx: &mut BenchAppContext) {
                     let inserted = if operation == "type" { "x" } else { "漢" };
                     editor.handle_input(inserted, window, cx);
                 } else {
-                    editor.backspace(&Default::default(), window, cx);
-                }
-            }
-            "backspace" => {
-                if toggle {
-                    editor.backspace(&Default::default(), window, cx);
-                } else {
-                    editor.handle_input(" ", window, cx);
+                    editor.backspace(&Backspace, window, cx);
                 }
             }
             "left_right" => {
                 if toggle {
-                    editor.move_left(&Default::default(), window, cx);
+                    editor.move_left(&MoveLeft, window, cx);
                 } else {
-                    editor.move_right(&Default::default(), window, cx);
+                    editor.move_right(&MoveRight, window, cx);
                 }
             }
             "up_down" | "up_down_cjk" => {
@@ -588,30 +582,34 @@ fn editor_edit_huge_unwrapped_line(operation: &&str, cx: &mut BenchAppContext) {
             }
             "home_end" => {
                 if toggle {
-                    editor.move_to_beginning_of_line(&Default::default(), window, cx);
+                    editor.move_to_beginning_of_line(&MoveToBeginningOfLine::default(), window, cx);
                 } else {
-                    editor.move_to_end_of_line(&Default::default(), window, cx);
+                    editor.move_to_end_of_line(&MoveToEndOfLine::default(), window, cx);
                 }
             }
             "word_motion" => {
                 if toggle {
-                    editor.move_to_previous_word_start(&Default::default(), window, cx);
+                    editor.move_to_previous_word_start(&MoveToPreviousWordStart, window, cx);
                 } else {
-                    editor.move_to_next_word_end(&Default::default(), window, cx);
+                    editor.move_to_next_word_end(&MoveToNextWordEnd, window, cx);
                 }
             }
             "newline_undo" => {
                 if toggle {
-                    editor.newline(&Default::default(), window, cx);
+                    editor.newline(&Newline, window, cx);
                 } else {
-                    editor.undo(&Default::default(), window, cx);
+                    editor.undo(&Undo, window, cx);
                 }
             }
             "select_to_line_start" => {
                 if toggle {
-                    editor.select_to_beginning_of_line(&Default::default(), window, cx);
+                    editor.select_to_beginning_of_line(
+                        &SelectToBeginningOfLine::default(),
+                        window,
+                        cx,
+                    );
                 } else {
-                    editor.move_to_end_of_line(&Default::default(), window, cx);
+                    editor.move_to_end_of_line(&MoveToEndOfLine::default(), window, cx);
                 }
             }
             _ => unreachable!(),

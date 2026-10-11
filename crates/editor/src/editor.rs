@@ -525,7 +525,7 @@ impl EditorMode {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug)]
 pub enum SoftWrap {
     /// Do not soft-wrap.
     None,
@@ -8262,7 +8262,7 @@ impl Editor {
                     window.focus(&rename_focus_handle, cx);
                     let block_id = this.insert_blocks(
                         [BlockProperties {
-                            style: BlockStyle::Flex,
+                            style: BlockStyle::FlexWithAnchor,
                             placement: BlockPlacement::Below(range.start),
                             height: Some(1),
                             render: Arc::new({
@@ -11159,7 +11159,7 @@ impl Editor {
         }
         let em_width = ScrollPixelOffset::from(text_layout_details.em_layout_width());
         let scroll_left = window.pixel_snap_f64(scroll_position.x * em_width);
-        let source_x = editor_snapshot.x_for_display_point(source, &text_layout_details);
+        let source_x = editor_snapshot.x_for_display_point_as_painted(source, &text_layout_details);
         let source_y = (source.row().as_f64() - scroll_top) * f64::from(line_height);
         Some(gpui::Point::new(
             Pixels::from(source_x - scroll_left),

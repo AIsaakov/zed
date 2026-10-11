@@ -740,6 +740,10 @@ impl<T: Item> SumTree<T> {
         }
     }
 
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     pub fn is_empty(&self) -> bool {
         match self.0.as_ref() {
             Node::Internal { .. } => false,

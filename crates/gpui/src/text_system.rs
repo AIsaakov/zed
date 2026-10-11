@@ -3,7 +3,6 @@ mod font_features;
 mod line;
 mod line_layout;
 mod line_wrapper;
-mod shaping_invariance;
 
 pub use font_fallbacks::*;
 pub use font_features::*;
@@ -12,7 +11,6 @@ pub use line_layout::*;
 pub use line_wrapper::*;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-pub use shaping_invariance::*;
 
 use crate::{
     Bounds, DevicePixels, Hsla, Pixels, PlatformTextSystem, Point, Result, SharedString, Size,
@@ -232,8 +230,10 @@ impl Drop for MissingGlyphReceiver {
 pub struct TextSystem {
     platform_text_system: Arc<dyn PlatformTextSystem>,
     font_ids_by_font: RwLock<FxHashMap<Font, Result<FontId>>>,
-    ascii_shaping_preserves_advances: RwLock<FxHashMap<Font, bool>>,
     font_metrics: RwLock<FxHashMap<FontId, FontMetrics>>,
+    glyph_ids: RwLock<FxHashMap<(FontId, char), Option<GlyphId>>>,
+    glyph_advances: RwLock<FxHashMap<(FontId, GlyphId), Size<f32>>>,
+    glyph_bounds: RwLock<FxHashMap<(FontId, GlyphId), Bounds<f32>>>,
     raster_bounds: RwLock<FxHashMap<RenderGlyphParams, Bounds<DevicePixels>>>,
     wrapper_pool: Mutex<FxHashMap<FontIdWithSize, Vec<LineWrapper>>>,
     font_runs_pool: Mutex<Vec<Vec<FontRun>>>,
@@ -251,9 +251,11 @@ impl TextSystem {
         TextSystem {
             platform_text_system,
             font_metrics: RwLock::default(),
+            glyph_ids: RwLock::default(),
+            glyph_advances: RwLock::default(),
+            glyph_bounds: RwLock::default(),
             raster_bounds: RwLock::default(),
             font_ids_by_font: RwLock::default(),
-            ascii_shaping_preserves_advances: RwLock::default(),
             wrapper_pool: Mutex::default(),
             font_runs_pool: Mutex::default(),
             fallback_font_stack: smallvec![
@@ -299,7 +301,6 @@ impl TextSystem {
     pub fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
         self.platform_text_system.add_fonts(fonts)?;
         self.font_ids_by_font.write().clear();
-        self.ascii_shaping_preserves_advances.write().clear();
         self.missing_glyph_reporter.reset();
         self.font_generation.fetch_add(1, Ordering::Release);
         Ok(())
@@ -408,22 +409,6 @@ impl TextSystem {
         self.platform_text_system.prewarm_fonts(&font_ids);
     }
 
-    /// Returns whether shaping printable ASCII in the given font can only produce runs whose
-    /// advances equal the sum of the characters' own advances.
-    pub fn ascii_shaping_preserves_advances(&self, font: &Font) -> bool {
-        if let Some(preserves) = self.ascii_shaping_preserves_advances.read().get(font) {
-            return *preserves;
-        }
-        let font_id = self.resolve_font(font);
-        let preserves = self
-            .platform_text_system
-            .ascii_shaping_preserves_advances(font_id, &font.features);
-        self.ascii_shaping_preserves_advances
-            .write()
-            .insert(font.clone(), preserves);
-        preserves
-    }
-
     /// Get the bounding box for the given font and font size.
     /// A font's bounding box is the smallest rectangle that could enclose all glyphs
     /// in the font. superimposed over one another.
@@ -438,13 +423,11 @@ impl TextSystem {
         font_size: Pixels,
         character: char,
     ) -> Result<Bounds<Pixels>> {
-        let glyph_id = self
-            .platform_text_system
-            .glyph_for_char(font_id, character)
-            .with_context(|| format!("glyph not found for character '{character}'"))?;
-        let bounds = self
-            .platform_text_system
-            .typographic_bounds(font_id, glyph_id)?;
+        let glyph_id = self.cached_glyph_for_char(font_id, character)?;
+        let bounds = get_or_compute(&self.glyph_bounds, (font_id, glyph_id), || {
+            self.platform_text_system
+                .typographic_bounds(font_id, glyph_id)
+        })?;
         Ok(self.read_metrics(font_id, |metrics| {
             (bounds / metrics.units_per_em as f32 * font_size.0).map(px)
         }))
@@ -452,14 +435,18 @@ impl TextSystem {
 
     /// Get the advance width for the given character, in the given font and size.
     pub fn advance(&self, font_id: FontId, font_size: Pixels, ch: char) -> Result<Size<Pixels>> {
-        let glyph_id = self
-            .platform_text_system
-            .glyph_for_char(font_id, ch)
-            .with_context(|| format!("glyph not found for character '{ch}'"))?;
-        let result = self.platform_text_system.advance(font_id, glyph_id)?
-            / self.units_per_em(font_id) as f32;
+        let glyph_id = self.cached_glyph_for_char(font_id, ch)?;
+        let advance = get_or_compute(&self.glyph_advances, (font_id, glyph_id), || {
+            self.platform_text_system.advance(font_id, glyph_id)
+        })?;
+        Ok(advance / self.units_per_em(font_id) as f32 * font_size)
+    }
 
-        Ok(result * font_size)
+    fn cached_glyph_for_char(&self, font_id: FontId, character: char) -> Result<GlyphId> {
+        get_or_compute(&self.glyph_ids, (font_id, character), || {
+            Ok(self.platform_text_system.glyph_for_char(font_id, character))
+        })?
+        .with_context(|| format!("glyph not found for character '{character}'"))
     }
 
     // Consider removing this?
@@ -668,26 +655,7 @@ impl WindowTextSystem {
             "text argument should not contain newlines"
         );
 
-        let mut decoration_runs = SmallVec::<[DecorationRun; 32]>::new();
-        for run in runs {
-            if let Some(last_run) = decoration_runs.last_mut()
-                && last_run.color == run.color
-                && last_run.underline == run.underline
-                && last_run.strikethrough == run.strikethrough
-                && last_run.background_color == run.background_color
-            {
-                last_run.len += run.len as u32;
-                continue;
-            }
-            decoration_runs.push(DecorationRun {
-                len: run.len as u32,
-                color: run.color,
-                background_color: run.background_color,
-                underline: run.underline,
-                strikethrough: run.strikethrough,
-            });
-        }
-
+        let decoration_runs = decoration_runs(runs);
         let layout = self.layout_line(&text, font_size, runs, force_width);
 
         ShapedLine {
@@ -716,26 +684,7 @@ impl WindowTextSystem {
         force_width: Option<Pixels>,
         materialize_text: impl FnOnce() -> SharedString,
     ) -> ShapedLine {
-        let mut decoration_runs = SmallVec::<[DecorationRun; 32]>::new();
-        for run in runs {
-            if let Some(last_run) = decoration_runs.last_mut()
-                && last_run.color == run.color
-                && last_run.underline == run.underline
-                && last_run.strikethrough == run.strikethrough
-                && last_run.background_color == run.background_color
-            {
-                last_run.len += run.len as u32;
-                continue;
-            }
-            decoration_runs.push(DecorationRun {
-                len: run.len as u32,
-                color: run.color,
-                background_color: run.background_color,
-                underline: run.underline,
-                strikethrough: run.strikethrough,
-            });
-        }
-
+        let decoration_runs = decoration_runs(runs);
         let mut used_force_width = force_width;
         let layout = self.layout_line_by_hash(
             text_hash,
@@ -911,38 +860,7 @@ impl WindowTextSystem {
         runs: &[TextRun],
         force_width: Option<Pixels>,
     ) -> Arc<LineLayout> {
-        let mut last_run = None::<&TextRun>;
-        let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
-        font_runs.clear();
-
-        for run in runs.iter() {
-            let decoration_changed = if let Some(last_run) = last_run
-                && last_run.color == run.color
-                && last_run.underline == run.underline
-                && last_run.strikethrough == run.strikethrough
-            // we do not consider differing background color relevant, as it does not affect glyphs
-            // && last_run.background_color == run.background_color
-            {
-                false
-            } else {
-                last_run = Some(run);
-                true
-            };
-
-            let font_id = self.resolve_font(&run.font);
-            if let Some(font_run) = font_runs.last_mut()
-                && font_id == font_run.font_id
-                && !decoration_changed
-            {
-                font_run.len += run.len;
-            } else {
-                font_runs.push(FontRun {
-                    len: run.len,
-                    font_id,
-                });
-            }
-        }
-
+        let font_runs = self.font_runs(runs);
         let layout = self.line_layout_cache.layout_line(
             &SharedString::new(text),
             font_size,
@@ -952,6 +870,21 @@ impl WindowTextSystem {
 
         self.font_runs_pool.lock().push(font_runs);
 
+        layout
+    }
+
+    /// Lays out the given line of text like [`Self::layout_line`], without caching the result.
+    pub fn layout_line_uncached(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        runs: &[TextRun],
+    ) -> LineLayout {
+        let font_runs = self.font_runs(runs);
+        let layout = self
+            .platform_text_system
+            .layout_line(text, font_size, &font_runs);
+        self.font_runs_pool.lock().push(font_runs);
         layout
     }
 
@@ -993,38 +926,7 @@ impl WindowTextSystem {
         runs: &[TextRun],
         force_width: Option<Pixels>,
     ) -> Option<Arc<LineLayout>> {
-        let mut last_run = None::<&TextRun>;
-        let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
-        font_runs.clear();
-
-        for run in runs.iter() {
-            let decoration_changed = if let Some(last_run) = last_run
-                && last_run.color == run.color
-                && last_run.underline == run.underline
-                && last_run.strikethrough == run.strikethrough
-            // we do not consider differing background color relevant, as it does not affect glyphs
-            // && last_run.background_color == run.background_color
-            {
-                false
-            } else {
-                last_run = Some(run);
-                true
-            };
-
-            let font_id = self.resolve_font(&run.font);
-            if let Some(font_run) = font_runs.last_mut()
-                && font_id == font_run.font_id
-                && !decoration_changed
-            {
-                font_run.len += run.len;
-            } else {
-                font_runs.push(FontRun {
-                    len: run.len,
-                    font_id,
-                });
-            }
-        }
-
+        let font_runs = self.font_runs(runs);
         let layout = self.line_layout_cache.try_layout_line_by_hash(
             text_hash,
             text_len,
@@ -1055,6 +957,22 @@ impl WindowTextSystem {
         force_width: Option<Pixels>,
         materialize_text: impl FnOnce() -> SharedString,
     ) -> Arc<LineLayout> {
+        let font_runs = self.font_runs(runs);
+        let layout = self.line_layout_cache.layout_line_by_hash(
+            text_hash,
+            text_len,
+            font_size,
+            &font_runs,
+            force_width,
+            materialize_text,
+        );
+
+        self.font_runs_pool.lock().push(font_runs);
+
+        layout
+    }
+
+    fn font_runs(&self, runs: &[TextRun]) -> Vec<FontRun> {
         let mut last_run = None::<&TextRun>;
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
         font_runs.clear();
@@ -1086,19 +1004,7 @@ impl WindowTextSystem {
                 });
             }
         }
-
-        let layout = self.line_layout_cache.layout_line_by_hash(
-            text_hash,
-            text_len,
-            font_size,
-            &font_runs,
-            force_width,
-            materialize_text,
-        );
-
-        self.font_runs_pool.lock().push(font_runs);
-
-        layout
+        font_runs
     }
 }
 
@@ -1465,6 +1371,42 @@ pub fn font_name_with_fallbacks_shared<'a>(
         ".ZedMono" | "Zed Plex Mono" => const { &SharedString::new_static("Lilex") },
         _ => name,
     }
+}
+
+fn get_or_compute<K: Hash + Eq, V: Copy>(
+    cache: &RwLock<FxHashMap<K, V>>,
+    key: K,
+    compute: impl FnOnce() -> Result<V>,
+) -> Result<V> {
+    if let Some(value) = cache.read().get(&key).copied() {
+        return Ok(value);
+    }
+    let value = compute()?;
+    cache.write().insert(key, value);
+    Ok(value)
+}
+
+fn decoration_runs(runs: &[TextRun]) -> SmallVec<[DecorationRun; 32]> {
+    let mut decoration_runs = SmallVec::<[DecorationRun; 32]>::new();
+    for run in runs {
+        if let Some(last_run) = decoration_runs.last_mut()
+            && last_run.color == run.color
+            && last_run.underline == run.underline
+            && last_run.strikethrough == run.strikethrough
+            && last_run.background_color == run.background_color
+        {
+            last_run.len += run.len as u32;
+            continue;
+        }
+        decoration_runs.push(DecorationRun {
+            len: run.len as u32,
+            color: run.color,
+            background_color: run.background_color,
+            underline: run.underline,
+            strikethrough: run.strikethrough,
+        });
+    }
+    decoration_runs
 }
 
 #[cfg(test)]

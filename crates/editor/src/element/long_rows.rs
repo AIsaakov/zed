@@ -1,21 +1,24 @@
 use std::{iter, ops::Range};
 
-use gpui::{App, Hsla, Pixels, Window};
-use language::LanguageAwareStyling;
+use gpui::{App, Entity, Hsla, Pixels, TextAlign, Window};
+
 use multi_buffer::Anchor;
 use sum_tree::Bias;
 use theme::Theme;
 use util::debug_panic;
 
-use super::LineWithInvisibles;
+use super::{LineFragment, LineWithInvisibles};
 use crate::{
     DisplayPoint, DisplayRow, Editor, EditorSnapshot, EditorStyle,
     display_map::{
-        DisplaySnapshot, GridCell, HighlightedChunk, HorizontalViewport, RulerShaper,
-        ToDisplayPoint, WindowedRowGeometry,
+        DisplaySnapshot, EstimatedRow, GridCell, HighlightedChunk, HorizontalViewport, RuledRow,
+        RulerShaper, ToDisplayPoint, WindowedRowGeometry,
     },
     movement::language_aware_styling,
+    scroll::{ScrollOffset, ScrollPixelOffset},
 };
+
+const RULER_WIDTH_TOLERANCE: ScrollPixelOffset = 0.1;
 
 pub(super) fn visible_highlight_ranges(
     snapshot: &EditorSnapshot,
@@ -31,13 +34,15 @@ pub(super) fn visible_highlight_ranges(
     let buffer = snapshot.buffer_snapshot();
     let anchor_at =
         |point: DisplayPoint, bias: Bias| buffer.anchor_at(point.to_offset(snapshot, bias), bias);
+    let range_end =
+        |point: DisplayPoint| buffer.anchor_before(point.to_offset(snapshot, Bias::Right));
     let mut ranges = Vec::new();
     let mut run_start = Some(visible_range.start);
     for row in rows.start.0..rows.end.0 {
         let display_row = DisplayRow(row);
         if let Some(row_len) = snapshot.long_unwrapped_row_len(display_row) {
             if let Some(run_start) = run_start.take() {
-                ranges.push(run_start..anchor_at(DisplayPoint::new(display_row, 0), Bias::Right));
+                ranges.push(run_start..range_end(DisplayPoint::new(display_row, 0)));
             }
             let bounds = long_row_columns(
                 snapshot,
@@ -50,7 +55,7 @@ pub(super) fn visible_highlight_ranges(
             );
             ranges.push(
                 anchor_at(DisplayPoint::new(display_row, bounds.start), Bias::Left)
-                    ..anchor_at(DisplayPoint::new(display_row, bounds.end), Bias::Right),
+                    ..range_end(DisplayPoint::new(display_row, bounds.end)),
             );
             run_start = Some(anchor_at(
                 DisplayPoint::new(display_row, row_len),
@@ -71,18 +76,26 @@ pub(super) fn background_highlights_in_ranges(
     snapshot: &DisplaySnapshot,
     theme: &Theme,
 ) -> Vec<(Range<DisplayPoint>, Hsla)> {
-    let mut highlights = Vec::new();
-    let mut previous_end = None::<DisplayPoint>;
-    for range in ranges {
-        highlights.extend(
-            editor
-                .background_highlights_in_range(range.clone(), snapshot, theme)
-                .into_iter()
-                .filter(|(highlight, _)| previous_end.is_none_or(|end| highlight.start >= end)),
-        );
-        previous_end = Some(range.end.to_display_point(snapshot));
-    }
-    highlights
+    query_ranges(
+        ranges,
+        snapshot,
+        |range| editor.background_highlights_in_range(range, snapshot, theme),
+        |(highlight, _)| highlight.start,
+    )
+}
+
+pub(super) fn redacted_ranges_in_ranges(
+    editor: &Editor,
+    ranges: &[Range<Anchor>],
+    snapshot: &DisplaySnapshot,
+    cx: &App,
+) -> Vec<Range<DisplayPoint>> {
+    query_ranges(
+        ranges,
+        snapshot,
+        |range| editor.redacted_ranges(range, snapshot, cx),
+        |redaction| redaction.start,
+    )
 }
 
 pub(super) fn layout_long_row(
@@ -103,7 +116,14 @@ pub(super) fn layout_long_row(
         let geometry = if snapshot.row_has_exact_grid(display_row, cell) {
             WindowedRowGeometry::new(row_len, cell, 0..0)
         } else {
-            WindowedRowGeometry::ruled(snapshot.ruled_row(display_row, shaper), row_len, cell, 0..0)
+            match ruled_row(snapshot, display_row, shaper) {
+                Some(ruled) => WindowedRowGeometry::ruled(ruled, row_len, cell, 0..0),
+                None => WindowedRowGeometry::estimated(
+                    EstimatedRow::new(snapshot, display_row, row_len),
+                    cell,
+                    0..0,
+                ),
+            }
         };
         return LineWithInvisibles::empty(font_size).windowed(geometry);
     };
@@ -111,6 +131,8 @@ pub(super) fn layout_long_row(
     let language_aware = shaper.language_aware;
     let shape = |chunks: &mut dyn Iterator<Item = HighlightedChunk<'_>>,
                  start: u32,
+                 row_bg: &[Vec<(Range<DisplayPoint>, Hsla)>],
+                 shape_without_backgrounds: bool,
                  window: &mut Window,
                  cx: &mut App| {
         LineWithInvisibles::from_chunks(
@@ -123,6 +145,7 @@ pub(super) fn layout_long_row(
             start as usize,
             |_| false,
             row_bg,
+            shape_without_backgrounds,
             window,
             cx,
         )
@@ -143,50 +166,214 @@ pub(super) fn layout_long_row(
     let geometry;
     if let Some((columns, _)) = snapshot.grid_window(display_row, row_len, &viewport, cell, &shaper)
     {
-        shaped = shape(&mut read(columns.clone()), columns.start, window, cx);
+        shaped = shape(
+            &mut read(columns.clone()),
+            columns.start,
+            &row_bg_in_columns(row_bg, columns.clone()),
+            false,
+            window,
+            cx,
+        );
         geometry = WindowedRowGeometry::new(row_len, cell, columns);
-    } else {
-        let ruled = snapshot.ruled_row(display_row, shaper);
+    } else if let Some(ruled) = ruled_row(snapshot, display_row, shaper) {
         let columns = ruled.columns_for_viewport(&viewport, cell);
-        let pieces = ruled.render_pieces(columns.clone()).collect::<Vec<_>>();
-        let read_range = pieces
-            .first()
-            .map_or(columns.start, |piece| piece.context.start)
-            ..pieces.last().map_or(columns.end, |piece| piece.context.end);
-        let chunks = read(read_range.clone()).collect::<Vec<_>>();
-        let last = pieces.len().saturating_sub(1);
-        let window_start_x = ruled.x_range_for_columns(columns.clone()).start;
-        shaped = shape(&mut iter::empty(), columns.start, window, cx);
-        for (ix, piece) in pieces.into_iter().enumerate() {
-            let mut part = shape(
-                &mut clip_chunks(&chunks, read_range.start, piece.context.clone()),
-                piece.context.start,
-                window,
-                cx,
-            );
-            if piece.context != piece.chunk {
-                part.trim_to(
-                    &piece.context,
-                    &piece.chunk,
-                    piece.width,
-                    (ix == 0, ix == last),
-                );
+        let pieces = ruled
+            .ruler
+            .render_pieces(columns.clone(), ruled.visible_x_range(&viewport, cell));
+
+        let last_ix = pieces.len().saturating_sub(1);
+        let window_start_x = ruled.ruler.x_range_for_columns(columns.clone()).start;
+        shaped = shape(&mut iter::empty(), columns.start, &[], false, window, cx);
+        let mut run_start = 0;
+        for run in pieces.chunk_by(|left, right| left.shaped == right.shaped) {
+            let first_ix = run_start;
+            run_start += run.len();
+            let (Some(first), Some(last)) = (run.first(), run.last()) else {
+                continue;
+            };
+            if !first.shaped {
+                for piece in run {
+                    shaped.append_at(
+                        LineWithInvisibles::gap(piece.chunk.len(), piece.width, font_size),
+                        Pixels::from(piece.x - window_start_x),
+                    );
+                }
+                continue;
             }
-            shaped.append_at(part, Pixels::from(piece.x - window_start_x));
+            let read_range = first.context.start..last.context.end;
+            let chunks = read(read_range.clone()).collect::<Vec<_>>();
+            for (offset, piece) in run.iter().enumerate() {
+                let ix = first_ix + offset;
+                let mut part = shape(
+                    &mut clip_chunks(&chunks, read_range.start, piece.context.clone()),
+                    piece.context.start,
+                    &row_bg_in_columns(row_bg, piece.context.clone()),
+                    true,
+                    window,
+                    cx,
+                );
+                debug_assert!(
+                    !ruled.exact
+                        || rendered_text_width(&part, &piece.context, &piece.chunk).is_none_or(
+                            |width| {
+                                (width - ScrollPixelOffset::from(piece.width)).abs()
+                                    <= RULER_WIDTH_TOLERANCE
+                            }
+                        ),
+                    "row {display_row:?} columns {:?} render {:?} px wide, the ruler expects {:?}",
+                    piece.chunk,
+                    rendered_text_width(&part, &piece.context, &piece.chunk),
+                    piece.width,
+                );
+                if piece.context != piece.chunk {
+                    part.extend_clipped_tabs(
+                        &snapshot.display_snapshot,
+                        display_row,
+                        &piece.context,
+                    );
+                    part.trim_to(
+                        &piece.context,
+                        &piece.chunk,
+                        piece.width,
+                        (ix == 0, ix == last_ix),
+                    );
+                }
+                shaped.append_at(part, Pixels::from(piece.x - window_start_x));
+            }
         }
         geometry = WindowedRowGeometry::ruled(ruled, row_len, cell, columns);
+    } else {
+        let estimated = EstimatedRow::new(snapshot, display_row, row_len);
+        let (columns, line) = snapshot.covering_estimated_window(
+            &estimated,
+            &viewport,
+            cell,
+            |columns, covered_end| {
+                let line = shape(
+                    &mut read(columns.clone()),
+                    columns.start,
+                    &row_bg_in_columns(row_bg, columns.clone()),
+                    false,
+                    window,
+                    cx,
+                );
+                let covered_width =
+                    Pixels::from(line.x_for_index((covered_end - columns.start) as usize));
+                (line, covered_width)
+            },
+        );
+        shaped = line;
+        geometry = WindowedRowGeometry::estimated(estimated, cell, columns);
     }
 
     shaped.extend_clipped_tabs(&snapshot.display_snapshot, display_row, geometry.window());
     if snapshot.shows_trailing_whitespace(display_row, cx) {
-        shaped.trailing_whitespace_start = Some(trailing_whitespace_start(
-            &snapshot.display_snapshot,
-            display_row,
-            row_len,
-            style,
-        ));
+        shaped.trailing_whitespace_start = Some(
+            snapshot
+                .display_snapshot
+                .cached_trailing_whitespace_start(display_row),
+        );
     }
     shaped.windowed(geometry)
+}
+
+pub(super) fn anchored_scroll_x(
+    editor: &Entity<Editor>,
+    snapshot: &EditorSnapshot,
+    rows: Range<DisplayRow>,
+    viewport: HorizontalViewport,
+    cell: GridCell,
+    em_layout_width: Pixels,
+    style: &EditorStyle,
+    editor_width: Pixels,
+    content_width: Pixels,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<ScrollOffset> {
+    let (anchor, offset) = editor.update(cx, |editor, cx| {
+        editor.scroll_manager.take_horizontal_anchor(cx)
+    })?;
+    let em_layout_width = ScrollPixelOffset::from(em_layout_width);
+    if em_layout_width <= 0. {
+        return None;
+    }
+    let point = anchor.to_display_point(snapshot);
+    if !rows.contains(&point.row()) {
+        return None;
+    }
+    let row_len = snapshot.long_unwrapped_row_len(point.row())?;
+    let shaper = ruler_shaper(snapshot, point.row(), style, window);
+    if !ruled_row(snapshot, point.row(), shaper).is_some_and(|ruled| ruled.exact) {
+        return None;
+    }
+    let layout = layout_long_row(
+        point.row(),
+        row_len,
+        Some(viewport),
+        cell,
+        snapshot,
+        style,
+        editor_width,
+        &[],
+        window,
+        cx,
+    );
+    let x = layout.alignment_offset(style.text.text_align, content_width)
+        + layout.x_for_index(point.column() as usize);
+    let scroll_x = ((x - offset) / em_layout_width).max(0.);
+    if ((scroll_x - viewport.scroll_columns) * em_layout_width).abs() < 0.5 {
+        return None;
+    }
+    editor.update(cx, |editor, cx| {
+        let mut position = editor.scroll_position(cx);
+        position.x = scroll_x;
+        editor.set_scroll_position_internal(position, false, true, window, cx);
+    });
+    Some(scroll_x)
+}
+
+pub(super) fn provisional_horizontal_anchor(
+    snapshot: &EditorSnapshot,
+    start_row: DisplayRow,
+    line_layouts: &[LineWithInvisibles],
+    newest_head: DisplayPoint,
+    scroll_left: ScrollPixelOffset,
+    text_align: TextAlign,
+    content_width: Pixels,
+) -> Option<(Anchor, ScrollPixelOffset)> {
+    let visible = scroll_left..=scroll_left + ScrollPixelOffset::from(content_width);
+    let aligned_x = |layout: &LineWithInvisibles, column: usize| {
+        layout.alignment_offset(text_align, content_width) + layout.x_for_index(column)
+    };
+    let provisional_layout = |row: DisplayRow| {
+        row.0
+            .checked_sub(start_row.0)
+            .and_then(|ix| line_layouts.get(ix as usize))
+            .filter(|layout| layout.is_provisional())
+    };
+    let (point, x) = provisional_layout(newest_head.row())
+        .map(|layout| aligned_x(layout, newest_head.column() as usize))
+        .filter(|x| visible.contains(x))
+        .map(|x| (newest_head, x))
+        .or_else(|| {
+            line_layouts
+                .iter()
+                .enumerate()
+                .filter(|(_, layout)| layout.is_provisional())
+                .find_map(|(ix, layout)| {
+                    let alignment = layout.alignment_offset(text_align, content_width);
+                    let column = layout.index_for_x(scroll_left - alignment)?;
+                    let row = DisplayRow(start_row.0 + ix as u32);
+                    Some((
+                        DisplayPoint::new(row, column as u32),
+                        aligned_x(layout, column),
+                    ))
+                })
+        })?;
+    let anchor = snapshot
+        .buffer_snapshot()
+        .anchor_before(point.to_offset(snapshot, Bias::Left));
+    Some((anchor, x - scroll_left))
 }
 
 pub(super) fn row_windowing(
@@ -200,14 +387,42 @@ pub(super) fn row_windowing(
     (rows.start.0..rows.end.0)
         .any(|row| snapshot.is_long_unwrapped_row(DisplayRow(row)))
         .then(|| {
-            let cell = GridCell::measure(
-                window.text_system(),
-                style,
-                snapshot.highlight_styles(),
-                font_size,
-            );
+            let cell = GridCell::measure(window.text_system(), style, snapshot, font_size);
             (viewport, cell)
         })
+}
+
+fn row_bg_in_columns(
+    row_bg: &[Vec<(Range<DisplayPoint>, Hsla)>],
+    columns: Range<u32>,
+) -> Vec<Vec<(Range<DisplayPoint>, Hsla)>> {
+    row_bg
+        .iter()
+        .map(|segments| {
+            let start = segments.partition_point(|(range, _)| range.end.column() <= columns.start);
+            let end = segments.partition_point(|(range, _)| range.start.column() < columns.end);
+            segments.get(start..end).unwrap_or_default().to_vec()
+        })
+        .collect()
+}
+
+fn query_ranges<T>(
+    ranges: &[Range<Anchor>],
+    snapshot: &DisplaySnapshot,
+    mut query: impl FnMut(Range<Anchor>) -> Vec<T>,
+    start: impl Fn(&T) -> DisplayPoint,
+) -> Vec<T> {
+    let mut results = Vec::new();
+    let mut previous_end = None::<DisplayPoint>;
+    for range in ranges {
+        results.extend(
+            query(range.clone())
+                .into_iter()
+                .filter(|result| previous_end.is_none_or(|end| start(result) >= end)),
+        );
+        previous_end = Some(range.end.to_display_point(snapshot));
+    }
+    results
 }
 
 fn long_row_columns(
@@ -222,9 +437,26 @@ fn long_row_columns(
     let shaper = ruler_shaper(snapshot, display_row, style, window);
     match snapshot.grid_window(display_row, row_len, viewport, cell, &shaper) {
         Some((columns, _)) => columns,
-        None => snapshot
-            .ruled_row(display_row, shaper)
-            .columns_for_viewport(viewport, cell),
+        None => match ruled_row(snapshot, display_row, shaper) {
+            Some(ruled) => ruled.columns_for_viewport(viewport, cell),
+            None => snapshot.estimated_window_bound(
+                &EstimatedRow::new(snapshot, display_row, row_len),
+                viewport,
+                cell,
+            ),
+        },
+    }
+}
+
+fn ruled_row(
+    snapshot: &EditorSnapshot,
+    display_row: DisplayRow,
+    shaper: RulerShaper,
+) -> Option<RuledRow> {
+    if snapshot.mode.is_minimap() {
+        None
+    } else {
+        snapshot.ruled_row(display_row, shaper)
     }
 }
 
@@ -275,46 +507,18 @@ fn clip_chunks<'a>(
     })
 }
 
-fn trailing_whitespace_start(
-    snapshot: &DisplaySnapshot,
-    row: DisplayRow,
-    row_len: u32,
-    style: &EditorStyle,
-) -> usize {
-    let language_aware = LanguageAwareStyling {
-        tree_sitter: false,
-        diagnostics: false,
-    };
-    let mut segment_end = row_len;
-    let mut segment_len = 64;
-    while segment_end > 0 {
-        let segment_start = snapshot
-            .clip_ignoring_line_ends(
-                DisplayPoint::new(row, segment_end.saturating_sub(segment_len)),
-                Bias::Left,
-            )
-            .column();
-        let mut column = segment_start as usize;
-        let mut text_end = None;
-        for chunk in snapshot.highlighted_chunks_in_range(
-            DisplayPoint::new(row, segment_start)..DisplayPoint::new(row, segment_end),
-            language_aware,
-            style,
-        ) {
-            if let Some((index, character)) = chunk
-                .text
-                .char_indices()
-                .rfind(|(_, character)| !character.is_whitespace())
-            {
-                text_end = Some(column + index + character.len_utf8());
-            }
-            column += chunk.text.len();
-        }
-        if let Some(text_end) = text_end {
-            return text_end;
-        }
-        segment_end = segment_start;
-        segment_len = segment_len.saturating_mul(2);
+fn rendered_text_width(
+    part: &LineWithInvisibles,
+    context: &Range<u32>,
+    chunk: &Range<u32>,
+) -> Option<ScrollPixelOffset> {
+    if part
+        .fragments
+        .iter()
+        .any(|fragment| matches!(fragment, LineFragment::Element { .. }))
+    {
+        return None;
     }
-    0
+    let x_at = |column: u32| part.x_for_index((column - context.start) as usize);
+    Some(x_at(chunk.end) - x_at(chunk.start))
 }

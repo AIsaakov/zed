@@ -303,6 +303,7 @@ impl<P: Debug> Debug for BlockProperties<P> {
 pub enum BlockStyle {
     Fixed,
     Flex,
+    FlexWithAnchor,
     /// Like `Flex` but doesn't use the gutter:
     /// - block content scrolls with buffer content
     /// - doesn't paint in gutter

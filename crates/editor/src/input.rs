@@ -3105,7 +3105,7 @@ impl EntityInputHandler for Editor {
         let start =
             MultiBufferOffsetUtf16(OffsetUtf16(range_utf16.start)).to_display_point(&snapshot);
         let x = Pixels::from(
-            snapshot.x_for_display_point(start, &text_layout_details)
+            snapshot.x_for_display_point_as_painted(start, &text_layout_details)
                 + ScrollOffset::from(self.gutter_dimensions.full_width())
                 - scroll_left,
         );

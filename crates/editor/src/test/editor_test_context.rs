@@ -311,8 +311,8 @@ impl EditorTestContext {
                     * Pixels::from(display_point.row().as_f64() - newest_point.row().as_f64());
             let x = pixel_position.x
                 + Pixels::from(
-                    snapshot.x_for_display_point(display_point, &details)
-                        - snapshot.x_for_display_point(newest_point, &details),
+                    snapshot.x_for_display_point_as_painted(display_point, &details)
+                        - snapshot.x_for_display_point_as_painted(newest_point, &details),
                 );
             Point::new(x, y)
         })

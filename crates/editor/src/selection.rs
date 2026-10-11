@@ -1877,7 +1877,7 @@ impl Editor {
 
                 let layout = display_map.layout_row(row, &text_layout_details);
                 if matches!(columnar_state, ColumnarSelectionState::FromSelection { .. })
-                    && start_x > layout.width()
+                    && layout.ends_before(start_x)
                 {
                     return None;
                 }

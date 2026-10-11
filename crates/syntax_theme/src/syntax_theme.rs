@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, btree_map::Entry},
+    hash::{DefaultHasher, Hash, Hasher},
     ops::Range,
     sync::Arc,
 };
@@ -10,18 +11,27 @@ use gpui::HighlightStyle;
 #[cfg(any(test, feature = "test-support"))]
 use gpui::Hsla;
 
-#[derive(Debug, PartialEq, Eq, Clone, Default)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct SyntaxTheme {
     highlights: Vec<HighlightStyle>,
     capture_name_map: BTreeMap<String, usize>,
+    fingerprint: u64,
+}
+
+impl Default for SyntaxTheme {
+    fn default() -> Self {
+        Self::new([])
+    }
 }
 
 impl SyntaxTheme {
     pub fn new(highlights: impl IntoIterator<Item = (String, HighlightStyle)>) -> Self {
-        let (capture_names, highlights) = highlights.into_iter().unzip();
+        let (capture_names, highlights) = highlights.into_iter().unzip::<_, _, _, Vec<_>>();
+        let capture_name_map = Self::create_capture_name_map(capture_names);
 
         Self {
-            capture_name_map: Self::create_capture_name_map(capture_names),
+            fingerprint: fingerprint(&highlights, &capture_name_map),
+            capture_name_map,
             highlights,
         }
     }
@@ -60,6 +70,10 @@ impl SyntaxTheme {
 
     pub fn highlights(&self) -> impl Iterator<Item = &HighlightStyle> {
         self.highlights.iter()
+    }
+
+    pub fn fingerprint(&self) -> u64 {
+        self.fingerprint
     }
 
     pub fn get(&self, highlight_index: impl Into<usize>) -> Option<&HighlightStyle> {
@@ -140,8 +154,16 @@ impl SyntaxTheme {
             }
         }
 
+        base.fingerprint = fingerprint(&base.highlights, &base.capture_name_map);
         Arc::new(base)
     }
+}
+
+fn fingerprint(highlights: &[HighlightStyle], capture_name_map: &BTreeMap<String, usize>) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    highlights.hash(&mut hasher);
+    capture_name_map.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[cfg(feature = "bundled-themes")]

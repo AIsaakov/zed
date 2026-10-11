@@ -321,6 +321,10 @@ impl Rope {
         self.len() == 0
     }
 
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        self.chunks.ptr_eq(&other.chunks)
+    }
+
     pub fn max_point(&self) -> Point {
         self.chunks.extent(())
     }
