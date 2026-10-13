@@ -1065,6 +1065,13 @@ impl Domain for WorkspaceDb {
         sql!(
             ALTER TABLE workspaces ADD COLUMN native_window_state BLOB;
         ),
+        // Add workspace file tracking (.code-workspace support). Appended after
+        // the upstream migrations so existing users' applied-migration indices
+        // are preserved.
+        sql!(
+            ALTER TABLE workspaces ADD COLUMN workspace_file_path TEXT;
+            ALTER TABLE workspaces ADD COLUMN workspace_file_kind TEXT;
+        ),
     ];
 
     // Allow recovering from bad migration that was initially shipped to nightly
@@ -1500,13 +1507,16 @@ impl WorkspaceDb {
         log::debug!("Saving workspace at location: {:?}", workspace.location);
         self.write(move |conn| {
             conn.with_savepoint("update_worktrees", || {
-                let remote_connection_id = match workspace.location.clone() {
-                    SerializedWorkspaceLocation::Local => None,
+                let (remote_connection_id, workspace_file_path, workspace_file_kind) = match workspace.location.clone() {
+                    SerializedWorkspaceLocation::Local => (None, None, None),
+                    SerializedWorkspaceLocation::LocalFromFile { workspace_file_path, workspace_file_kind } => {
+                        (None, Some(workspace_file_path.to_string_lossy().to_string()), Some(workspace_file_kind))
+                    }
                     SerializedWorkspaceLocation::Remote(connection_options) => {
-                        Some(Self::get_or_create_remote_connection_internal(
+                        (Some(Self::get_or_create_remote_connection_internal(
                             conn,
                             connection_options
-                        )?.0)
+                        )?.0), None, None)
                     }
                 };
 
@@ -1626,9 +1636,11 @@ impl WorkspaceDb {
                         bottom_dock_zoom,
                         session_id,
                         window_id,
+                        workspace_file_path,
+                        workspace_file_kind,
                         timestamp
                     )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, CURRENT_TIMESTAMP)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, CURRENT_TIMESTAMP)
                     ON CONFLICT DO
                     UPDATE SET
                         paths = ?2,
@@ -1647,6 +1659,8 @@ impl WorkspaceDb {
                         bottom_dock_zoom = ?15,
                         session_id = ?16,
                         window_id = ?17,
+                        workspace_file_path = ?18,
+                        workspace_file_kind = ?19,
                         timestamp = CURRENT_TIMESTAMP
                 );
                 let mut prepared_query = conn.exec_bound(query)?;
@@ -1660,6 +1674,9 @@ impl WorkspaceDb {
                     workspace.docks,
                     workspace.session_id,
                     workspace.window_id,
+                    // Nested so the args tuple stays within sqlez's 10-element
+                    // Bind limit; the pair binds to ?18 and ?19 in order.
+                    (workspace_file_path, workspace_file_kind),
                 );
 
                 prepared_query(args).context("Updating workspace")?;
@@ -1847,6 +1864,8 @@ impl WorkspaceDb {
             Option<PathList>,
             Option<RemoteConnectionId>,
             Option<String>,
+            Option<String>,
+            Option<String>,
             DateTime<Utc>,
         )>,
     > {
@@ -1862,6 +1881,8 @@ impl WorkspaceDb {
                     identity_paths_order,
                     remote_connection_id,
                     session_id,
+                    workspace_file_path,
+                    workspace_file_kind,
                     timestamp,
                 )| {
                     (
@@ -1875,6 +1896,8 @@ impl WorkspaceDb {
                         }),
                         remote_connection_id.map(RemoteConnectionId),
                         session_id,
+                        workspace_file_path,
+                        workspace_file_kind,
                         parse_timestamp(&timestamp),
                     )
                 },
@@ -1883,8 +1906,8 @@ impl WorkspaceDb {
     }
 
     query! {
-        fn recent_workspaces_query() -> Result<Vec<(WorkspaceId, String, String, Option<String>, Option<String>, Option<u64>, Option<String>, String)>> {
-            SELECT workspace_id, paths, paths_order, identity_paths, identity_paths_order, remote_connection_id, session_id, timestamp
+        fn recent_workspaces_query() -> Result<Vec<(WorkspaceId, String, String, Option<String>, Option<String>, Option<u64>, Option<String>, Option<String>, Option<String>, String)>> {
+            SELECT workspace_id, paths, paths_order, identity_paths, identity_paths_order, remote_connection_id, session_id, workspace_file_path, workspace_file_kind, timestamp
             FROM workspaces
             WHERE
                 paths IS NOT NULL OR
@@ -2065,8 +2088,16 @@ impl WorkspaceDb {
     ) -> Result<Vec<RecentWorkspace>> {
         let remote_connections = self.remote_connections()?;
         let mut result = Vec::new();
-        for (id, paths, identity_paths_hint, remote_connection_id, _session_id, timestamp) in
-            self.recent_workspaces()?
+        for (
+            id,
+            paths,
+            identity_paths_hint,
+            remote_connection_id,
+            _session_id,
+            workspace_file_path,
+            workspace_file_kind,
+            timestamp,
+        ) in self.recent_workspaces()?
         {
             if let Some(remote_connection_id) = remote_connection_id {
                 if let Some(connection_options) = remote_connections.get(&remote_connection_id) {
@@ -2090,9 +2121,23 @@ impl WorkspaceDb {
                     .await
                     .or(identity_paths_hint)
                     .unwrap_or_else(|| paths.clone());
+                let location = match (workspace_file_path, workspace_file_kind) {
+                    (Some(file_path), Some(file_kind)) => {
+                        let workspace_path = PathBuf::from(&file_path);
+                        if workspace_path.exists() {
+                            SerializedWorkspaceLocation::LocalFromFile {
+                                workspace_file_path: workspace_path,
+                                workspace_file_kind: file_kind,
+                            }
+                        } else {
+                            SerializedWorkspaceLocation::Local
+                        }
+                    }
+                    _ => SerializedWorkspaceLocation::Local,
+                };
                 result.push(RecentWorkspace {
                     workspace_id: id,
-                    location: SerializedWorkspaceLocation::Local,
+                    location,
                     paths,
                     identity_paths,
                     timestamp,
@@ -2118,7 +2163,8 @@ impl WorkspaceDb {
     ) -> Result<Vec<WorkspaceId>> {
         let target_paths = &target.identity_paths;
         let target_remote_connection = match &target.location {
-            SerializedWorkspaceLocation::Local => None,
+            SerializedWorkspaceLocation::Local
+            | SerializedWorkspaceLocation::LocalFromFile { .. } => None,
             SerializedWorkspaceLocation::Remote(connection) => {
                 Some(remote_connection_identity(connection))
             }
@@ -2127,7 +2173,7 @@ impl WorkspaceDb {
         let remote_connections = self.remote_connections()?;
 
         let mut workspace_ids = Vec::new();
-        for (workspace_id, paths, identity_paths, remote_connection_id, _, _) in
+        for (workspace_id, paths, identity_paths, remote_connection_id, _, _, _, _) in
             self.recent_workspaces()?
         {
             let remote_connection = if let Some(id) = remote_connection_id {
@@ -2170,7 +2216,7 @@ impl WorkspaceDb {
         let remote_connections = self.remote_connections()?;
         let now = Utc::now();
         let mut workspaces_to_delete = Vec::new();
-        for (id, paths, _identity_paths_hint, remote_connection_id, session_id, timestamp) in
+        for (id, paths, _identity_paths_hint, remote_connection_id, session_id, _, _, timestamp) in
             self.recent_workspaces()?
         {
             if let Some(session_id) = session_id.as_deref() {
@@ -2713,7 +2759,8 @@ pub struct RecentWorkspace {
 impl RecentWorkspace {
     pub fn project_group_key(&self) -> ProjectGroupKey {
         let host = match &self.location {
-            SerializedWorkspaceLocation::Local => None,
+            SerializedWorkspaceLocation::Local
+            | SerializedWorkspaceLocation::LocalFromFile { .. } => None,
             SerializedWorkspaceLocation::Remote(options) => Some(options.clone()),
         };
         ProjectGroupKey::new(host, self.identity_paths.clone())
@@ -2755,7 +2802,8 @@ fn dedupe_recent_workspaces(
     let mut result: Vec<RecentWorkspace> = Vec::new();
     for workspace in workspaces {
         let location_identity = match &workspace.location {
-            SerializedWorkspaceLocation::Local => None,
+            SerializedWorkspaceLocation::Local
+            | SerializedWorkspaceLocation::LocalFromFile { .. } => None,
             SerializedWorkspaceLocation::Remote(connection) => {
                 Some(remote_connection_identity(connection))
             }
