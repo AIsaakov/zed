@@ -334,6 +334,15 @@ impl SerializedPaneGroup {
             }
         }
     }
+
+    pub(crate) fn item_count(&self) -> usize {
+        match self {
+            SerializedPaneGroup::Group { children, .. } => {
+                children.iter().map(SerializedPaneGroup::item_count).sum()
+            }
+            SerializedPaneGroup::Pane(serialized_pane) => serialized_pane.children.len(),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Default, Clone)]

@@ -67,6 +67,25 @@ fn parse_timestamp(text: &str) -> DateTime<Utc> {
         .unwrap_or_else(|_| Utc::now())
 }
 
+fn is_git_message_file(path: &Path) -> bool {
+    const GIT_MESSAGE_FILES: [&str; 8] = [
+        "COMMIT_EDITMSG",
+        "MERGE_MSG",
+        "SQUASH_MSG",
+        "TAG_EDITMSG",
+        "NOTES_EDITMSG",
+        "EDIT_DESCRIPTION",
+        "git-rebase-todo",
+        "addp-hunk-edit.diff",
+    ];
+    path.components()
+        .any(|component| component.as_os_str() == ".git")
+        || path
+            .file_name()
+            .and_then(|file_name| file_name.to_str())
+            .is_some_and(|file_name| GIT_MESSAGE_FILES.contains(&file_name))
+}
+
 fn contains_wsl_path(paths: &PathList) -> bool {
     cfg!(windows)
         && paths
@@ -2042,19 +2061,24 @@ impl WorkspaceDb {
         }
     }
 
+    async fn restorable_in_session(paths: &[PathBuf], fs: &dyn Fs) -> bool {
+        match Self::existing_paths_include_a_directory(paths, fs).await {
+            Some(true) => true,
+            Some(false) => !paths.iter().all(|path| is_git_message_file(path)),
+            None => false,
+        }
+    }
+
     async fn all_paths_exist_with_a_directory(paths: &[PathBuf], fs: &dyn Fs) -> bool {
+        Self::existing_paths_include_a_directory(paths, fs).await == Some(true)
+    }
+
+    async fn existing_paths_include_a_directory(paths: &[PathBuf], fs: &dyn Fs) -> Option<bool> {
         let mut any_dir = false;
         for path in paths {
-            match fs.metadata(path).await.ok().flatten() {
-                None => return false,
-                Some(meta) => {
-                    if meta.is_dir {
-                        any_dir = true;
-                    }
-                }
-            }
+            any_dir |= fs.metadata(path).await.ok().flatten()?.is_dir;
         }
-        any_dir
+        Some(any_dir)
     }
 
     // Returns the raw recent workspace history. Scratch workspaces (no paths) are filtered
@@ -2245,7 +2269,7 @@ impl WorkspaceDb {
                 continue;
             }
 
-            if paths.is_empty() || Self::all_paths_exist_with_a_directory(paths.paths(), fs).await {
+            if paths.is_empty() || Self::restorable_in_session(paths.paths(), fs).await {
                 workspaces.push(SessionWorkspace {
                     workspace_id,
                     location: SerializedWorkspaceLocation::Local,
@@ -4162,6 +4186,37 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_last_session_restores_file_only_workspace(cx: &mut gpui::TestAppContext) {
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/repo", json!({ "note.txt": "", ".git": { "config": "" } }))
+            .await;
+        fs.insert_tree("/bare.git", json!({ "COMMIT_EDITMSG": "" }))
+            .await;
+        let db = WorkspaceDb::open_test_db("test_last_session_restores_file_only_workspace").await;
+        let workspaces = [
+            vec![PathBuf::from("/repo/note.txt")],
+            vec![PathBuf::from("/repo/.git/config")],
+            vec![PathBuf::from("/repo"), PathBuf::from("/repo/.git/config")],
+            vec![PathBuf::from("/bare.git/COMMIT_EDITMSG")],
+        ];
+        for (id, paths) in (1..).zip(&workspaces) {
+            let paths = paths.iter().map(PathBuf::as_path).collect::<Vec<_>>();
+            db.save_workspace(workspace_with(id, &paths, empty_pane_group(), Some("s")))
+                .await;
+        }
+
+        let mut sessions = db
+            .last_session_workspace_locations("s", None, fs.as_ref())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|session| session.workspace_id)
+            .collect::<Vec<_>>();
+        sessions.sort();
+        assert_eq!(sessions, vec![WorkspaceId(1), WorkspaceId(3)]);
+    }
+
+    #[gpui::test]
     async fn test_last_session_workspace_locations_remote(cx: &mut gpui::TestAppContext) {
         let fs = fs::FakeFs::new(cx.executor());
         let db =
@@ -4890,6 +4945,75 @@ mod tests {
             std::slice::from_ref(&dir),
             "shutdown should flush the pending workspace serialization"
         );
+    }
+
+    #[gpui::test]
+    async fn test_flush_during_restore_keeps_restored_layout(cx: &mut gpui::TestAppContext) {
+        crate::tests::init_test(cx);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        let db = cx.update(|_, cx| WorkspaceDb::global(cx));
+        let workspace_id = db.next_id().await.unwrap();
+        workspace.update(cx, |workspace, _| workspace.set_database_id(workspace_id));
+
+        let center_group = SerializedPaneGroup::Pane(SerializedPane::new(
+            vec![SerializedItem::new("TestItem", 1, true, false)],
+            true,
+            0,
+        ));
+        let bookmarks = BTreeMap::from_iter([(
+            Arc::<Path>::from(Path::new("/tmp/file.rs")),
+            vec![SerializedBookmark {
+                row: 3,
+                label: "bookmark".to_owned(),
+            }],
+        )]);
+        let serialized_workspace = SerializedWorkspace {
+            id: workspace_id,
+            bookmarks: bookmarks.clone(),
+            ..default_workspace::<&Path>(&[], &center_group)
+        };
+        db.save_workspace(serialized_workspace.clone()).await;
+
+        let restore = workspace.update_in(cx, |workspace, window, cx| {
+            crate::open_items(
+                workspace,
+                Some(serialized_workspace),
+                Vec::new(),
+                true,
+                window,
+                cx,
+            )
+        });
+        let flush = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.flush_serialization(window, cx)
+        });
+        drop(restore);
+        flush.await;
+
+        assert_eq!(
+            db.workspace_for_id(workspace_id)
+                .map(|workspace| (workspace.center_group, workspace.bookmarks)),
+            Some((center_group, bookmarks))
+        );
+
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.flush_serialization(window, cx)
+            })
+            .await;
+        let Some(SerializedPaneGroup::Pane(pane)) = db
+            .workspace_for_id(workspace_id)
+            .map(|workspace| workspace.center_group)
+        else {
+            panic!("expected a single pane after the restore was dropped");
+        };
+        assert_eq!(pane.children, Vec::new());
     }
 
     #[gpui::test]
@@ -6206,7 +6330,7 @@ mod tests {
         let restored_handle: gpui::WindowHandle<MultiWorkspace> = cx
             .update(|_, cx| {
                 cx.spawn(async move |mut cx| {
-                    crate::restore_multiworkspace(serialized_mw, app_state, &mut cx).await
+                    crate::restore_multiworkspace(serialized_mw, app_state, None, &mut cx).await
                 })
             })
             .await

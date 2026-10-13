@@ -79,6 +79,15 @@ impl ProjectEnvironment {
         }
     }
 
+    pub(crate) fn set_cli_environment_if_unset(
+        &mut self,
+        cli_environment: HashMap<String, String>,
+    ) {
+        if self.cli_environment.is_none() && !self.is_remote_project {
+            self.cli_environment = Some(cli_environment);
+        }
+    }
+
     pub fn buffer_environment(
         &mut self,
         buffer: &Entity<Buffer>,

@@ -474,6 +474,7 @@ impl remote::RemoteClientDelegate for RemoteClientDelegate {
             self.window
                 .update(cx, |_, window, cx| {
                     self.ui.update(cx, |modal, cx| {
+                        window.request_attention();
                         modal.set_prompt(prompt, tx, cancellation, window, cx);
                     })
                 })
