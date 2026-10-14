@@ -90,7 +90,7 @@ pub use pane_group::{
     SplitDirection,
 };
 pub use persistence::{
-    RecentWorkspace, WorkspaceDb, delete_unloaded_items,
+    RecentWorkspace, WorkspaceDb, apply_workspace_file_locations, delete_unloaded_items,
     model::{
         DockData, DockStructure, ItemId, MultiWorkspaceState, SerializedMultiWorkspace,
         SerializedProjectGroup, SerializedWorkspaceLocation, SessionWorkspace,
@@ -7774,7 +7774,10 @@ impl Workspace {
                 };
 
                 let db = WorkspaceDb::global(cx);
+                let fork_db = db::fork::ForkDb::global(cx);
                 let kvp = db::kvp::KeyValueStore::global(cx);
+                let workspace_id = serialized_workspace.id;
+                let workspace_file_source = serialized_workspace.location.workspace_file_source();
                 cx.background_spawn(async move {
                     if let Some(docks) = default_docks {
                         persistence::write_default_dock_state(&kvp, docks)
@@ -7782,6 +7785,13 @@ impl Workspace {
                             .log_err();
                     }
                     db.save_workspace(serialized_workspace).await;
+                    persistence::write_workspace_file(
+                        &fork_db,
+                        workspace_id,
+                        workspace_file_source,
+                    )
+                    .await
+                    .log_err();
                 })
             }
             WorkspaceLocation::None => {

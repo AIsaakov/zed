@@ -344,6 +344,7 @@ fn main() {
         .with_restart_arguments(restart_arguments);
 
     let app_db = db::AppDatabase::new();
+    let fork_db = db::fork::ForkDb::new();
     let system_id = app.background_executor().spawn(system_id());
     let installation_id = app
         .background_executor()
@@ -478,6 +479,7 @@ fn main() {
 
     app.run(move |cx| {
         cx.set_global(app_db);
+        cx.set_global(fork_db);
         let db_trusted_paths = match workspace::WorkspaceDb::global(cx).fetch_trusted_worktrees() {
             Ok(trusted_paths) => trusted_paths,
             Err(e) => {

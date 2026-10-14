@@ -1,3 +1,4 @@
+pub mod fork;
 pub mod kvp;
 pub mod query;
 
@@ -202,7 +203,7 @@ pub async fn open_db<M: Migrator + 'static>(
     open_fallback_db::<M>().await
 }
 
-async fn open_main_db<M: Migrator>(db_path: &Path) -> Option<ThreadSafeConnection> {
+pub(crate) async fn open_main_db<M: Migrator>(db_path: &Path) -> Option<ThreadSafeConnection> {
     log::trace!("Opening database {}", db_path.display());
     ThreadSafeConnection::builder::<M>(db_path.to_string_lossy().as_ref(), true)
         .with_db_initialization_query(DB_INITIALIZE_QUERY)

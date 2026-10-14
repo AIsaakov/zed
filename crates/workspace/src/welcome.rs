@@ -2,7 +2,7 @@ use crate::{
     NewFile, Open, OpenMode, PathList, RecentWorkspace, SerializedWorkspaceLocation,
     ToggleWorkspaceSidebar, Workspace, WorkspaceSettings,
     item::{Item, ItemEvent},
-    persistence::WorkspaceDb,
+    persistence::{WorkspaceDb, apply_workspace_file_locations},
 };
 use agent_settings::AgentSettings;
 use git::Clone as GitClone;
@@ -260,13 +260,17 @@ impl WelcomePage {
                 .upgrade()
                 .map(|ws| ws.read(cx).app_state().fs.clone());
             let db = WorkspaceDb::global(cx);
+            let fork_db = db::fork::ForkDb::global(cx);
             cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
                 let Some(fs) = fs else { return };
-                let workspaces = db
+                let mut workspaces = db
                     .recent_project_workspaces(fs.as_ref())
                     .await
                     .log_err()
                     .unwrap_or_default();
+                apply_workspace_file_locations(&fork_db, fs.as_ref(), &mut workspaces)
+                    .await
+                    .log_err();
 
                 this.update(cx, |this, cx| {
                     this.recent_workspaces = Some(workspaces);

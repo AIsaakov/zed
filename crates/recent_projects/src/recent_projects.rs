@@ -39,6 +39,7 @@ pub use remote_servers::RemoteServerProjects;
 use settings::{DefaultOpenBehavior, Settings, WorktreeId};
 use workspace::ProjectGroupKey;
 
+use db::fork::ForkDb;
 use dev_container::{DevContainerContext, find_devcontainer_configs};
 use ui::{
     ButtonLike, ContextMenu, Divider, HighlightedLabel, KeyBinding, ListItem, ListItemSpacing,
@@ -48,7 +49,8 @@ use util::{ResultExt, paths::PathExt};
 use workspace::{
     HistoryManager, ModalView, MultiWorkspace, OpenMode, OpenOptions, OpenVisible, RecentWorkspace,
     SerializedWorkspaceLocation, Workspace, WorkspaceDb, WorkspaceId,
-    notifications::DetachAndPromptErr, with_active_or_new_workspace,
+    apply_workspace_file_locations, notifications::DetachAndPromptErr,
+    with_active_or_new_workspace,
 };
 use zed_actions::{OpenDevContainer, OpenRecent, OpenRemote};
 
@@ -665,13 +667,17 @@ impl RecentProjects {
         // We do not want to block the UI on a potentially lengthy call to DB, so we're gonna swap
         // out workspace locations once the future runs to completion.
         let db = WorkspaceDb::global(cx);
+        let fork_db = ForkDb::global(cx);
         cx.spawn_in(window, async move |this, cx| {
             let Some(fs) = fs else { return };
-            let workspaces = db
+            let mut workspaces = db
                 .recent_project_workspaces(fs.as_ref())
                 .await
                 .log_err()
                 .unwrap_or_default();
+            apply_workspace_file_locations(&fork_db, fs.as_ref(), &mut workspaces)
+                .await
+                .log_err();
             this.update_in(cx, move |this, window, cx| {
                 this.picker.update(cx, move |picker, cx| {
                     picker.delegate.set_workspaces(workspaces);
@@ -2235,7 +2241,12 @@ impl RecentProjectsDelegate {
                         .await?;
                         Ok(())
                     })
-                    .detach_and_prompt_err("Failed to open project", window, cx, |_, _, _| None);
+                    .detach_and_prompt_err(
+                        "Failed to open project",
+                        window,
+                        cx,
+                        |_, _, _| None,
+                    );
                 }
                 SerializedWorkspaceLocation::Remote(mut connection) => {
                     let app_state = workspace.app_state().clone();
@@ -2387,6 +2398,7 @@ impl RecentProjectsDelegate {
                 .upgrade()
                 .map(|ws| ws.read(cx).app_state().fs.clone());
             let db = WorkspaceDb::global(cx);
+            let fork_db = ForkDb::global(cx);
             cx.spawn_in(window, async move |this, cx| {
                 let Some(fs) = fs else { return };
                 let deleted_workspace_ids = db
@@ -2394,10 +2406,13 @@ impl RecentProjectsDelegate {
                     .await
                     .log_err()
                     .unwrap_or_default();
-                let workspaces = db
+                let mut workspaces = db
                     .recent_project_workspaces(fs.as_ref())
                     .await
                     .unwrap_or_default();
+                apply_workspace_file_locations(&fork_db, fs.as_ref(), &mut workspaces)
+                    .await
+                    .log_err();
                 this.update_in(cx, move |picker, window, cx| {
                     Self::update_picker_after_recent_project_deletion(
                         picker, ix, workspaces, window, cx,
