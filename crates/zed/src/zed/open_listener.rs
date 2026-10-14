@@ -1365,7 +1365,7 @@ mod tests {
             path!("/root/Project (2,3)").to_string(),
             path!("/root/test 123").to_string(),
         ];
-        let result = derive_paths_with_position(fs.as_ref(), inputs).await;
+        let (result, workspace_file_source) = derive_paths_with_position(fs.as_ref(), inputs).await;
 
         let paths: Vec<_> = result
             .iter()
@@ -1379,6 +1379,7 @@ mod tests {
                 (path!("/root/test 123").to_string(), None, None),
             ]
         );
+        assert_eq!(workspace_file_source, None);
     }
 
     // Test file with colon (`:`) in the name on non-Windows platforms,
@@ -1394,9 +1395,10 @@ mod tests {
         fs.insert_tree(path!("/root"), json!({ "test.txt:10": "" }))
             .await;
 
-        let result =
+        let (result, workspace_file_source) =
             derive_paths_with_position(fs.as_ref(), vec![path!("/root/test.txt:10").to_string()])
                 .await;
+        assert_eq!(workspace_file_source, None);
 
         let paths: Vec<_> = result
             .iter()
@@ -1421,9 +1423,10 @@ mod tests {
         fs.insert_tree(path!("/root"), json!({ "test.txt": "" }))
             .await;
 
-        let result =
+        let (result, workspace_file_source) =
             derive_paths_with_position(fs.as_ref(), vec![path!("/root/test.txt:10").to_string()])
                 .await;
+        assert_eq!(workspace_file_source, None);
 
         let paths: Vec<_> = result
             .iter()
